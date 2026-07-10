@@ -4,36 +4,17 @@ import { useRef } from "react";
 import Image from "next/image";
 import { gsap, useGSAP } from "@/lib/gsap";
 import { IMAGES } from "@/lib/images";
+import { V1_PRODUCTS } from "@/lib/catalog";
+import { useCart } from "@/lib/CartContext";
 
-const PRODUCTS = [
-  {
-    tag: "Harvest Oct 2025",
-    name: "First Press",
-    desc: "Koroneiki extra virgin, unfiltered. Green, peppery, loud. 500 ml.",
-    price: "$38",
-    img: IMAGES.productOil,
-    alt: "Bottle of Verdale extra virgin olive oil with olives and branches",
-  },
-  {
-    tag: "Brined 9 months",
-    name: "Table Olives",
-    desc: "Kalamata olives cured in sea-salt brine and a little red-wine vinegar. 320 g.",
-    price: "$14",
-    img: IMAGES.productOlives,
-    alt: "Bowls of Kalamata and green table olives",
-  },
-  {
-    tag: "The gift",
-    name: "The Harvest Table",
-    desc: "First Press, Table Olives and our fig-and-olive tapenade, boxed for giving.",
-    price: "$64",
-    img: IMAGES.productSet,
-    alt: "A spread of olives, oil, cheese and bread on a table",
-  },
-];
+const PRODUCTS = V1_PRODUCTS.map((p) => ({
+  ...p,
+  img: IMAGES[p.imgKey],
+}));
 
 export default function Products() {
   const ref = useRef<HTMLElement>(null);
+  const { addItem } = useCart();
 
   useGSAP(
     () => {
@@ -80,7 +61,14 @@ export default function Products() {
               <p className="shop__price">{p.price}</p>
             </div>
             <p className="shop__desc">{p.desc}</p>
-            <button className="shop__add" type="button">
+            <button
+              className="shop__add"
+              type="button"
+              onClick={() =>
+                addItem({ id: p.id, name: p.name, amount: p.amount, price: p.price })
+              }
+              aria-label={`Add ${p.name} to cart`}
+            >
               Add to cart
             </button>
           </article>

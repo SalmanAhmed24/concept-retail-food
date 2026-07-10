@@ -2,9 +2,11 @@
 
 import { useRef } from "react";
 import { gsap, useGSAP } from "@/lib/gsap";
+import { useCart } from "@/lib/CartContext";
 
 export default function Nav() {
   const ref = useRef<HTMLElement>(null);
+  const { count, openCart } = useCart();
 
   useGSAP(
     () => {
@@ -31,8 +33,13 @@ export default function Nav() {
           <li><a href="#visit">Visit</a></li>
         </ul>
       </nav>
-      <button className="nav__cart" type="button">
-        Cart <span aria-hidden="true">·</span> 0
+      <button
+        className="nav__cart"
+        type="button"
+        onClick={openCart}
+        aria-label={`Open cart, ${count} item${count === 1 ? "" : "s"}`}
+      >
+        Cart <span aria-hidden="true">·</span> {count}
       </button>
     </header>
   );

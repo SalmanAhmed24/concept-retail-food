@@ -3,9 +3,11 @@
 import { useRef } from "react";
 import Link from "next/link";
 import { gsap, useGSAP } from "@/lib/gsap";
+import { useCart } from "@/lib/CartContext";
 
 export default function V2Nav() {
   const ref = useRef<HTMLElement>(null);
+  const { count, openCart } = useCart();
 
   useGSAP(
     () => {
@@ -33,7 +35,14 @@ export default function V2Nav() {
       </nav>
       <div className="v2-nav__side">
         <Link className="v2-nav__alt" href="/">Concept 01 ↗</Link>
-        <button className="v2-nav__cart" type="button">Cart · 0</button>
+        <button
+          className="v2-nav__cart"
+          type="button"
+          onClick={openCart}
+          aria-label={`Open cart, ${count} item${count === 1 ? "" : "s"}`}
+        >
+          Cart · {count}
+        </button>
       </div>
     </header>
   );

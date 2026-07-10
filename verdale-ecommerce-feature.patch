@@ -1,0 +1,1480 @@
+From 703e7ac529712e55208c78ac1235dcb319ceeb30 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 10 Jul 2026 05:50:07 +0000
+Subject: [PATCH] Add ecommerce: shared cart, checkout, and Stripe payments
+ across / and /v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Extract products into src/lib/catalog.ts (typed, server-safe, single
+  source of truth for prices; /v2 adds the Press Club item)
+- Shared CartContext with localStorage persistence; one CartDrawer
+  mounted in the root layout so both concepts use the same cart
+- Wire the dead 'Add to cart' buttons in Products (v1) and V2Rail,
+  and the 'Cart · 0' buttons in both navs to live counts
+- /checkout page (Verdale design language) with order summary
+- /api/checkout creating Stripe Checkout Sessions with server-side
+  price lookup and qty limits (client can never set prices)
+- Demo mode when STRIPE_SECRET_KEY is unset; /checkout/success links
+  back to both concepts; .env.example documents setup
+- Note: Press Club is charged as a one-time first-quarter payment;
+  true recurring billing needs a Stripe recurring price + webhooks
+---
+ package-lock.json                 |  24 +-
+ package.json                      |   3 +-
+ src/app/api/checkout/route.ts     |  99 ++++++
+ src/app/checkout/page.tsx         | 134 +++++++++
+ src/app/checkout/success/page.tsx |  55 ++++
+ src/app/globals.css               | 482 ++++++++++++++++++++++++++++++
+ src/app/layout.tsx                |   9 +-
+ src/components/CartDrawer.tsx     | 117 ++++++++
+ src/components/Nav.tsx            |  11 +-
+ src/components/Products.tsx       |  42 +--
+ src/components/v2/V2Nav.tsx       |  11 +-
+ src/components/v2/V2Rail.tsx      |  51 +---
+ src/lib/CartContext.tsx           | 127 ++++++++
+ src/lib/catalog.ts                |  77 +++++
+ 14 files changed, 1172 insertions(+), 70 deletions(-)
+ create mode 100644 src/app/api/checkout/route.ts
+ create mode 100644 src/app/checkout/page.tsx
+ create mode 100644 src/app/checkout/success/page.tsx
+ create mode 100644 src/components/CartDrawer.tsx
+ create mode 100644 src/lib/CartContext.tsx
+ create mode 100644 src/lib/catalog.ts
+
+diff --git a/package-lock.json b/package-lock.json
+index 88659c4..16f07c6 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -13,7 +13,8 @@
+         "lenis": "^1.3.25",
+         "next": "16.2.10",
+         "react": "19.2.4",
+-        "react-dom": "19.2.4"
++        "react-dom": "19.2.4",
++        "stripe": "^22.3.1"
+       },
+       "devDependencies": {
+         "@types/node": "^20",
+@@ -1296,7 +1297,7 @@
+       "version": "20.19.43",
+       "resolved": "https://registry.npmjs.org/@types/node/-/node-20.19.43.tgz",
+       "integrity": "sha512-6oYBAi5ikg4Pl+kGsoYtawUMBT2zZMCvPNF7pVLnHZfd1zf38DRiWn/gT01RYCdUqkv7Fhr+C9ot4/tb+2sVvA==",
+-      "dev": true,
++      "devOptional": true,
+       "license": "MIT",
+       "dependencies": {
+         "undici-types": "~6.21.0"
+@@ -5565,6 +5566,23 @@
+         "url": "https://github.com/sponsors/sindresorhus"
+       }
+     },
++    "node_modules/stripe": {
++      "version": "22.3.1",
++      "resolved": "https://registry.npmjs.org/stripe/-/stripe-22.3.1.tgz",
++      "integrity": "sha512-6XSLN0KK0IdfXqDHqMg6CDoO3eO62ye9dhzw0fZp55AUOzHR1YRJOqYHTsuCi4QJ4Ni/usEmXtq69c9ghKDmYw==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      },
++      "peerDependencies": {
++        "@types/node": ">=18"
++      },
++      "peerDependenciesMeta": {
++        "@types/node": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/styled-jsx": {
+       "version": "5.1.6",
+       "resolved": "https://registry.npmjs.org/styled-jsx/-/styled-jsx-5.1.6.tgz",
+@@ -5872,7 +5890,7 @@
+       "version": "6.21.0",
+       "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-6.21.0.tgz",
+       "integrity": "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==",
+-      "dev": true,
++      "devOptional": true,
+       "license": "MIT"
+     },
+     "node_modules/unrs-resolver": {
+diff --git a/package.json b/package.json
+index 13a664b..c3dbca5 100644
+--- a/package.json
++++ b/package.json
+@@ -14,7 +14,8 @@
+     "lenis": "^1.3.25",
+     "next": "16.2.10",
+     "react": "19.2.4",
+-    "react-dom": "19.2.4"
++    "react-dom": "19.2.4",
++    "stripe": "^22.3.1"
+   },
+   "devDependencies": {
+     "@types/node": "^20",
+diff --git a/src/app/api/checkout/route.ts b/src/app/api/checkout/route.ts
+new file mode 100644
+index 0000000..f373aee
+--- /dev/null
++++ b/src/app/api/checkout/route.ts
+@@ -0,0 +1,99 @@
++import { NextResponse, type NextRequest } from "next/server";
++import { findItem, type CatalogItem } from "@/lib/catalog";
++
++type CheckoutBody = {
++  customer?: { name?: string; email?: string; notes?: string };
++  items?: { id?: string; qty?: number }[];
++};
++
++/**
++ * POST /api/checkout
++ * Body: { customer: { name, email, notes }, items: [{ id, qty }] }
++ *
++ * Prices are always resolved server-side from lib/catalog.ts by item id,
++ * so a tampered client can never set its own prices.
++ *
++ * With STRIPE_SECRET_KEY set, this creates a real Stripe Checkout Session
++ * and returns its hosted payment URL. Without it, the route runs in demo
++ * mode and returns the success page URL directly so the flow can be
++ * exercised end-to-end in development.
++ */
++export async function POST(request: NextRequest) {
++  let body: CheckoutBody;
++  try {
++    body = (await request.json()) as CheckoutBody;
++  } catch {
++    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
++  }
++
++  const { customer, items } = body ?? {};
++
++  if (!Array.isArray(items) || items.length === 0) {
++    return NextResponse.json({ error: "Your cart is empty" }, { status: 400 });
++  }
++  if (!customer?.email || !customer?.name) {
++    return NextResponse.json({ error: "Name and email are required" }, { status: 400 });
++  }
++
++  // Resolve items against the server-side catalog
++  const lineItems: { item: CatalogItem; quantity: number }[] = [];
++  for (const { id, qty } of items) {
++    const item = id ? findItem(id) : undefined;
++    const quantity = Number.parseInt(String(qty), 10);
++    if (!item || !Number.isFinite(quantity) || quantity < 1 || quantity > 20) {
++      return NextResponse.json({ error: `Invalid cart item: ${id}` }, { status: 400 });
++    }
++    lineItems.push({ item, quantity });
++  }
++
++  const origin =
++    request.headers.get("origin") ||
++    process.env.NEXT_PUBLIC_SITE_URL ||
++    "http://localhost:3000";
++
++  const secretKey = process.env.STRIPE_SECRET_KEY;
++
++  // ---- Demo mode (no Stripe key configured) ----
++  if (!secretKey) {
++    const total = lineItems.reduce((n, li) => n + li.item.amount * li.quantity, 0);
++    return NextResponse.json({
++      url: `${origin}/checkout/success?demo=1&total=${total.toFixed(2)}`,
++    });
++  }
++
++  // ---- Real Stripe Checkout ----
++  try {
++    const { default: Stripe } = await import("stripe");
++    const stripe = new Stripe(secretKey);
++
++    const session = await stripe.checkout.sessions.create({
++      mode: "payment",
++      customer_email: customer.email,
++      line_items: lineItems.map(({ item, quantity }) => ({
++        quantity,
++        price_data: {
++          currency: "usd",
++          unit_amount: Math.round(item.amount * 100),
++          product_data: {
++            name: item.name,
++            description: item.desc,
++          },
++        },
++      })),
++      metadata: {
++        customer_name: String(customer.name).slice(0, 500),
++        notes: String(customer.notes ?? "").slice(0, 500),
++      },
++      success_url: `${origin}/checkout/success?session_id={CHECKOUT_SESSION_ID}`,
++      cancel_url: `${origin}/checkout`,
++    });
++
++    return NextResponse.json({ url: session.url });
++  } catch (err) {
++    console.error("Stripe checkout error:", err);
++    return NextResponse.json(
++      { error: "Could not start payment. Please try again." },
++      { status: 500 }
++    );
++  }
++}
+diff --git a/src/app/checkout/page.tsx b/src/app/checkout/page.tsx
+new file mode 100644
+index 0000000..5c59ec1
+--- /dev/null
++++ b/src/app/checkout/page.tsx
+@@ -0,0 +1,134 @@
++"use client";
++
++import { useState, type ChangeEvent, type FormEvent } from "react";
++import Link from "next/link";
++import { useRouter } from "next/navigation";
++import { useCart, formatMoney } from "@/lib/CartContext";
++
++export default function CheckoutPage() {
++  const { items, subtotal } = useCart();
++  const router = useRouter();
++  const [form, setForm] = useState({ name: "", email: "", notes: "" });
++  const [status, setStatus] = useState<"idle" | "submitting" | "error">("idle");
++  const [error, setError] = useState("");
++
++  const set =
++    (key: keyof typeof form) =>
++    (e: ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
++      setForm((f) => ({ ...f, [key]: e.target.value }));
++
++  async function handleSubmit(e: FormEvent) {
++    e.preventDefault();
++    if (items.length === 0) return;
++    setStatus("submitting");
++    setError("");
++    try {
++      const res = await fetch("/api/checkout", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({
++          customer: form,
++          items: items.map(({ id, qty }) => ({ id, qty })),
++        }),
++      });
++      const data = (await res.json()) as { url?: string; error?: string };
++      if (!res.ok) throw new Error(data.error || "Checkout failed");
++      if (data.url) {
++        // Stripe-hosted payment page (or demo success page)
++        window.location.assign(data.url);
++      } else {
++        router.push("/checkout/success");
++      }
++    } catch (err) {
++      setStatus("error");
++      setError(err instanceof Error ? err.message : "Something went wrong. Please try again.");
++    }
++  }
++
++  return (
++    <main className="checkout">
++      <div className="checkout__head">
++        <p className="checkout__kicker">Verdale · Harvest 2025</p>
++        <h1>
++          Check<em>out</em>
++        </h1>
++      </div>
++
++      {items.length === 0 ? (
++        <div className="checkout__empty">
++          <p>Your cart is empty — the shop is a scroll away.</p>
++          <Link className="checkout__back" href="/#shop">
++            Back to the shop
++          </Link>
++        </div>
++      ) : (
++        <div className="checkout__grid">
++          <form className="checkout__form" onSubmit={handleSubmit}>
++            <label>
++              Your name
++              <input
++                required
++                value={form.name}
++                onChange={set("name")}
++                placeholder="Alexis Papadopoulos"
++              />
++            </label>
++            <label>
++              Email
++              <input
++                required
++                type="email"
++                value={form.email}
++                onChange={set("email")}
++                placeholder="you@example.com"
++              />
++            </label>
++            <label>
++              Delivery notes (optional)
++              <textarea
++                rows={3}
++                value={form.notes}
++                onChange={set("notes")}
++                placeholder="Leave with the neighbor if we're out."
++              />
++            </label>
++
++            {status === "error" && (
++              <p className="checkout__error" role="alert">
++                {error}
++              </p>
++            )}
++
++            <button className="checkout__pay" disabled={status === "submitting"}>
++              {status === "submitting"
++                ? "Taking you to payment…"
++                : `Pay ${formatMoney(subtotal)}`}
++            </button>
++            <p className="checkout__secure">Secured by Stripe Checkout</p>
++          </form>
++
++          <aside className="checkout__summary" aria-label="Order summary">
++            <h2>Your order</h2>
++            <ul>
++              {items.map((item) => (
++                <li key={item.id}>
++                  <span>
++                    {item.name} × {item.qty}
++                  </span>
++                  <span>{formatMoney(item.amount * item.qty)}</span>
++                </li>
++              ))}
++            </ul>
++            <div className="checkout__total">
++              <span>Total</span>
++              <strong>{formatMoney(subtotal)}</strong>
++            </div>
++            <Link href="/#shop" className="checkout__edit">
++              ← Keep shopping
++            </Link>
++          </aside>
++        </div>
++      )}
++    </main>
++  );
++}
+diff --git a/src/app/checkout/success/page.tsx b/src/app/checkout/success/page.tsx
+new file mode 100644
+index 0000000..fabc5f2
+--- /dev/null
++++ b/src/app/checkout/success/page.tsx
+@@ -0,0 +1,55 @@
++"use client";
++
++import { Suspense, useEffect } from "react";
++import Link from "next/link";
++import { useSearchParams } from "next/navigation";
++import { useCart } from "@/lib/CartContext";
++
++function SuccessContent() {
++  const { clearCart } = useCart();
++  const params = useSearchParams();
++  const isDemo = params.get("demo") === "1";
++  const total = params.get("total");
++
++  // Payment finished — empty the cart
++  useEffect(() => {
++    clearCart();
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++
++  return (
++    <main className="success">
++      <p className="checkout__kicker">Verdale · Harvest 2025</p>
++      <h1>
++        Order <em>confirmed</em>
++      </h1>
++      <p className="success__copy">
++        Efcharistó. A confirmation email is on its way, and your order ships with the
++        next weekly dispatch from the estate. Unfiltered means a little sediment —
++        that&apos;s the point.
++      </p>
++      {isDemo && (
++        <p className="success__demo">
++          Demo mode: no payment was actually taken{total ? ` (order total $${total})` : ""}.
++          Set <code>STRIPE_SECRET_KEY</code> to enable real payments.
++        </p>
++      )}
++      <div className="success__links">
++        <Link className="checkout__back" href="/">
++          Concept 01
++        </Link>
++        <Link className="checkout__back" href="/v2">
++          Concept 02
++        </Link>
++      </div>
++    </main>
++  );
++}
++
++export default function SuccessPage() {
++  return (
++    <Suspense fallback={null}>
++      <SuccessContent />
++    </Suspense>
++  );
++}
+diff --git a/src/app/globals.css b/src/app/globals.css
+index 15ae5c2..90449ad 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -1013,3 +1013,485 @@ button {
+   white-space: nowrap;
+   border: 0;
+ }
++
++/* ------------------------------------------------------------------
++   Ecommerce — cart drawer (shared by / and /v2)
++------------------------------------------------------------------- */
++.cart-overlay {
++  position: fixed;
++  inset: 0;
++  z-index: 300;
++  background: rgba(20, 24, 15, 0.6);
++  backdrop-filter: blur(2px);
++  opacity: 0;
++  pointer-events: none;
++  transition: opacity 0.3s var(--ease-out);
++}
++
++.cart-overlay.is-open {
++  opacity: 1;
++  pointer-events: auto;
++}
++
++.cart-drawer {
++  position: fixed;
++  top: 0;
++  right: 0;
++  bottom: 0;
++  z-index: 310;
++  width: min(440px, 94vw);
++  display: flex;
++  flex-direction: column;
++  background: var(--brine);
++  color: var(--plaster);
++  border-left: 1px solid var(--hairline-dark);
++  transform: translateX(105%);
++  transition: transform 0.45s var(--ease-out);
++}
++
++.cart-drawer.is-open {
++  transform: translateX(0);
++}
++
++.cart-drawer__head {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  padding: 1.6rem 1.9rem;
++  border-bottom: 1px solid var(--hairline-dark);
++}
++
++.cart-drawer__head h2 {
++  font-family: var(--font-display);
++  font-weight: 400;
++  font-size: 1.7rem;
++  letter-spacing: 0.01em;
++}
++
++.cart-drawer__head h2 em {
++  color: var(--oil-bright);
++  font-style: italic;
++}
++
++.cart-drawer__close {
++  background: none;
++  border: 1px solid var(--hairline-dark);
++  border-radius: 50%;
++  width: 2.4rem;
++  height: 2.4rem;
++  color: var(--plaster);
++  cursor: pointer;
++  transition: border-color 0.25s ease, color 0.25s ease;
++}
++
++.cart-drawer__close:hover {
++  border-color: var(--oil-bright);
++  color: var(--oil-bright);
++}
++
++.cart-drawer__empty {
++  flex: 1;
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  justify-content: center;
++  gap: 1.4rem;
++  text-align: center;
++  padding: 2rem;
++  color: var(--sage);
++}
++
++.cart-drawer__browse,
++.cart-drawer__checkout {
++  display: inline-block;
++  background: var(--oil);
++  color: var(--brine);
++  font-family: var(--font-body);
++  font-weight: 700;
++  font-size: 0.85rem;
++  letter-spacing: 0.14em;
++  text-transform: uppercase;
++  text-decoration: none;
++  border: none;
++  cursor: pointer;
++  padding: 1rem 1.6rem;
++  transition: background 0.25s ease;
++}
++
++.cart-drawer__browse:hover,
++.cart-drawer__checkout:hover {
++  background: var(--oil-bright);
++}
++
++.cart-drawer__items {
++  list-style: none;
++  flex: 1;
++  overflow-y: auto;
++  padding: 1.2rem 1.9rem;
++}
++
++.cart-line {
++  display: flex;
++  justify-content: space-between;
++  gap: 1rem;
++  padding: 1.2rem 0;
++  border-bottom: 1px solid var(--hairline-dark);
++}
++
++.cart-line__info h3 {
++  font-family: var(--font-display);
++  font-weight: 400;
++  font-size: 1.2rem;
++}
++
++.cart-line__unit {
++  color: var(--sage);
++  font-size: 0.85rem;
++  margin-top: 0.15rem;
++}
++
++.cart-line__qty {
++  display: flex;
++  align-items: center;
++  gap: 0.8rem;
++  margin-top: 0.7rem;
++}
++
++.cart-line__qty button {
++  width: 1.7rem;
++  height: 1.7rem;
++  border: 1px solid var(--hairline-dark);
++  border-radius: 50%;
++  background: none;
++  color: var(--plaster);
++  cursor: pointer;
++  line-height: 1;
++  transition: border-color 0.2s ease, color 0.2s ease;
++}
++
++.cart-line__qty button:hover {
++  border-color: var(--oil-bright);
++  color: var(--oil-bright);
++}
++
++.cart-line__qty span {
++  min-width: 1.2rem;
++  text-align: center;
++  font-variant-numeric: tabular-nums;
++}
++
++.cart-line__end {
++  display: flex;
++  flex-direction: column;
++  align-items: flex-end;
++  justify-content: space-between;
++  gap: 0.5rem;
++}
++
++.cart-line__total {
++  font-variant-numeric: tabular-nums;
++  color: var(--oil-bright);
++}
++
++.cart-line__remove {
++  background: none;
++  border: none;
++  color: var(--sage);
++  font-size: 0.75rem;
++  letter-spacing: 0.08em;
++  text-transform: uppercase;
++  text-decoration: underline;
++  cursor: pointer;
++  padding: 0;
++  transition: color 0.2s ease;
++}
++
++.cart-line__remove:hover {
++  color: var(--plaster);
++}
++
++.cart-drawer__foot {
++  padding: 1.5rem 1.9rem 1.9rem;
++  border-top: 1px solid var(--hairline-dark);
++}
++
++.cart-drawer__subtotal {
++  display: flex;
++  justify-content: space-between;
++  align-items: baseline;
++  font-size: 1.05rem;
++}
++
++.cart-drawer__subtotal strong {
++  font-family: var(--font-display);
++  font-size: 1.5rem;
++  font-weight: 400;
++  color: var(--oil-bright);
++}
++
++.cart-drawer__note {
++  color: var(--sage);
++  font-size: 0.8rem;
++  letter-spacing: 0.06em;
++  margin: 0.4rem 0 1.3rem;
++}
++
++.cart-drawer__checkout {
++  display: block;
++  width: 100%;
++  text-align: center;
++}
++
++/* ------------------------------------------------------------------
++   Ecommerce — checkout + success pages
++------------------------------------------------------------------- */
++.checkout,
++.success {
++  min-height: 100vh;
++  background: var(--brine);
++  color: var(--plaster);
++  padding: clamp(6rem, 12vw, 9rem) var(--gutter) 6rem;
++}
++
++.checkout__kicker {
++  font-size: 0.75rem;
++  letter-spacing: 0.22em;
++  text-transform: uppercase;
++  color: var(--sage);
++  margin-bottom: 1rem;
++}
++
++.checkout__head h1,
++.success h1 {
++  font-family: var(--font-display);
++  font-weight: 400;
++  font-size: clamp(2.6rem, 6vw, 4.2rem);
++  line-height: 1.02;
++}
++
++.checkout__head h1 em,
++.success h1 em {
++  font-style: italic;
++  color: var(--oil-bright);
++}
++
++.checkout__head {
++  margin-bottom: 3rem;
++}
++
++.checkout__grid {
++  display: grid;
++  grid-template-columns: 1.3fr 1fr;
++  gap: 2.5rem;
++  align-items: start;
++  max-width: 68rem;
++}
++
++.checkout__form {
++  display: flex;
++  flex-direction: column;
++  gap: 1.4rem;
++  border: 1px solid var(--hairline-dark);
++  background: var(--brine-2);
++  padding: 2.2rem;
++}
++
++.checkout__form label {
++  display: flex;
++  flex-direction: column;
++  gap: 0.5rem;
++  font-size: 0.8rem;
++  letter-spacing: 0.14em;
++  text-transform: uppercase;
++  color: var(--sage);
++}
++
++.checkout__form input,
++.checkout__form textarea {
++  font-family: var(--font-body);
++  font-size: 1rem;
++  color: var(--plaster);
++  background: var(--brine);
++  border: 1px solid var(--hairline-dark);
++  padding: 0.9rem 1rem;
++  resize: vertical;
++  transition: border-color 0.25s ease;
++}
++
++.checkout__form input:focus,
++.checkout__form textarea:focus {
++  outline: none;
++  border-color: var(--oil);
++}
++
++.checkout__pay {
++  background: var(--oil);
++  color: var(--brine);
++  border: none;
++  cursor: pointer;
++  font-family: var(--font-body);
++  font-weight: 700;
++  font-size: 0.85rem;
++  letter-spacing: 0.14em;
++  text-transform: uppercase;
++  padding: 1.1rem 1.6rem;
++  margin-top: 0.4rem;
++  transition: background 0.25s ease;
++}
++
++.checkout__pay:hover {
++  background: var(--oil-bright);
++}
++
++.checkout__pay:disabled {
++  opacity: 0.55;
++  cursor: wait;
++}
++
++.checkout__secure {
++  text-align: center;
++  color: var(--sage);
++  font-size: 0.75rem;
++  letter-spacing: 0.18em;
++  text-transform: uppercase;
++}
++
++.checkout__error {
++  border: 1px solid var(--oil);
++  background: rgba(198, 154, 46, 0.1);
++  color: var(--oil-bright);
++  padding: 0.8rem 1rem;
++  font-size: 0.9rem;
++  letter-spacing: 0.02em;
++  text-transform: none;
++}
++
++.checkout__empty {
++  display: flex;
++  flex-direction: column;
++  align-items: flex-start;
++  gap: 1.4rem;
++  font-size: 1.1rem;
++  color: var(--sage);
++}
++
++.checkout__back {
++  display: inline-block;
++  color: var(--oil-bright);
++  font-size: 0.85rem;
++  letter-spacing: 0.14em;
++  text-transform: uppercase;
++  text-decoration: none;
++  border-bottom: 1px solid var(--oil-bright);
++  padding-bottom: 0.2rem;
++  transition: color 0.2s ease, border-color 0.2s ease;
++}
++
++.checkout__back:hover {
++  color: var(--plaster);
++  border-color: var(--plaster);
++}
++
++.checkout__summary {
++  border: 1px solid var(--hairline-dark);
++  padding: 2rem 2.2rem;
++  position: sticky;
++  top: 6rem;
++}
++
++.checkout__summary h2 {
++  font-family: var(--font-display);
++  font-weight: 400;
++  font-size: 1.5rem;
++  margin-bottom: 1.4rem;
++}
++
++.checkout__summary ul {
++  list-style: none;
++  display: flex;
++  flex-direction: column;
++  gap: 0.8rem;
++}
++
++.checkout__summary li {
++  display: flex;
++  justify-content: space-between;
++  gap: 1rem;
++  font-size: 0.95rem;
++  color: var(--plaster-2);
++  font-variant-numeric: tabular-nums;
++}
++
++.checkout__total {
++  display: flex;
++  justify-content: space-between;
++  align-items: baseline;
++  margin-top: 1.4rem;
++  padding-top: 1.2rem;
++  border-top: 1px solid var(--hairline-dark);
++}
++
++.checkout__total strong {
++  font-family: var(--font-display);
++  font-weight: 400;
++  font-size: 1.6rem;
++  color: var(--oil-bright);
++}
++
++.checkout__edit {
++  display: inline-block;
++  margin-top: 1.4rem;
++  color: var(--sage);
++  font-size: 0.8rem;
++  letter-spacing: 0.1em;
++  text-transform: uppercase;
++  text-decoration: underline;
++}
++
++.checkout__edit:hover {
++  color: var(--plaster);
++}
++
++.success {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  justify-content: center;
++  text-align: center;
++  gap: 1.4rem;
++}
++
++.success__copy {
++  max-width: 44ch;
++  color: var(--plaster-2);
++  line-height: 1.7;
++}
++
++.success__demo {
++  border: 1px dashed var(--hairline-dark);
++  color: var(--sage);
++  padding: 0.9rem 1.2rem;
++  font-size: 0.85rem;
++  max-width: 52ch;
++}
++
++.success__demo code {
++  color: var(--oil-bright);
++  font-size: 0.8rem;
++}
++
++.success__links {
++  display: flex;
++  gap: 1.6rem;
++  margin-top: 0.6rem;
++}
++
++@media (max-width: 900px) {
++  .checkout__grid {
++    grid-template-columns: 1fr;
++  }
++  .checkout__summary {
++    position: static;
++    order: -1;
++  }
++}
+diff --git a/src/app/layout.tsx b/src/app/layout.tsx
+index 2048f91..9ab7acb 100644
+--- a/src/app/layout.tsx
++++ b/src/app/layout.tsx
+@@ -1,5 +1,7 @@
+ import type { Metadata } from "next";
+ import "./globals.css";
++import { CartProvider } from "@/lib/CartContext";
++import CartDrawer from "@/components/CartDrawer";
+ 
+ export const metadata: Metadata = {
+   title: "Verdale — Single-Estate Olive House",
+@@ -20,7 +22,12 @@ export default function RootLayout({
+           rel="stylesheet"
+         />
+       </head>
+-      <body>{children}</body>
++      <body>
++        <CartProvider>
++          {children}
++          <CartDrawer />
++        </CartProvider>
++      </body>
+     </html>
+   );
+ }
+diff --git a/src/components/CartDrawer.tsx b/src/components/CartDrawer.tsx
+new file mode 100644
+index 0000000..7f5f6f4
+--- /dev/null
++++ b/src/components/CartDrawer.tsx
+@@ -0,0 +1,117 @@
++"use client";
++
++import { useEffect } from "react";
++import Link from "next/link";
++import { useCart, formatMoney } from "@/lib/CartContext";
++
++export default function CartDrawer() {
++  const { items, subtotal, isOpen, closeCart, setQty, removeItem } = useCart();
++
++  // Close on Escape, lock scroll while open
++  useEffect(() => {
++    if (!isOpen) return;
++    const onKey = (e: KeyboardEvent) => e.key === "Escape" && closeCart();
++    document.addEventListener("keydown", onKey);
++    document.body.style.overflow = "hidden";
++    return () => {
++      document.removeEventListener("keydown", onKey);
++      document.body.style.overflow = "";
++    };
++  }, [isOpen, closeCart]);
++
++  return (
++    <>
++      <div
++        className={`cart-overlay${isOpen ? " is-open" : ""}`}
++        onClick={closeCart}
++        aria-hidden="true"
++      />
++      <aside
++        className={`cart-drawer${isOpen ? " is-open" : ""}`}
++        role="dialog"
++        aria-modal="true"
++        aria-label="Your cart"
++      >
++        <div className="cart-drawer__head">
++          <h2>
++            Your <em>cart</em>
++          </h2>
++          <button
++            className="cart-drawer__close"
++            onClick={closeCart}
++            type="button"
++            aria-label="Close cart"
++          >
++            ✕
++          </button>
++        </div>
++
++        {items.length === 0 ? (
++          <div className="cart-drawer__empty">
++            <p>
++              Nothing here yet. The 2025 pressing
++              <br />
++              won&apos;t wait forever.
++            </p>
++            <button className="cart-drawer__browse" onClick={closeCart} type="button">
++              Back to the shop
++            </button>
++          </div>
++        ) : (
++          <>
++            <ul className="cart-drawer__items">
++              {items.map((item) => (
++                <li className="cart-line" key={item.id}>
++                  <div className="cart-line__info">
++                    <h3>{item.name}</h3>
++                    <p className="cart-line__unit">{item.price}</p>
++                    <div className="cart-line__qty" aria-label={`Quantity of ${item.name}`}>
++                      <button
++                        type="button"
++                        onClick={() => setQty(item.id, item.qty - 1)}
++                        aria-label="Decrease quantity"
++                      >
++                        −
++                      </button>
++                      <span aria-live="polite">{item.qty}</span>
++                      <button
++                        type="button"
++                        onClick={() => setQty(item.id, item.qty + 1)}
++                        aria-label="Increase quantity"
++                      >
++                        +
++                      </button>
++                    </div>
++                  </div>
++                  <div className="cart-line__end">
++                    <span className="cart-line__total">
++                      {formatMoney(item.amount * item.qty)}
++                    </span>
++                    <button
++                      type="button"
++                      className="cart-line__remove"
++                      onClick={() => removeItem(item.id)}
++                      aria-label={`Remove ${item.name} from cart`}
++                    >
++                      Remove
++                    </button>
++                  </div>
++                </li>
++              ))}
++            </ul>
++            <div className="cart-drawer__foot">
++              <div className="cart-drawer__subtotal">
++                <span>Subtotal</span>
++                <strong>{formatMoney(subtotal)}</strong>
++              </div>
++              <p className="cart-drawer__note">Ships worldwide, weekly · from the estate</p>
++              <Link className="cart-drawer__checkout" href="/checkout" onClick={closeCart}>
++                Proceed to checkout
++              </Link>
++            </div>
++          </>
++        )}
++      </aside>
++    </>
++  );
++}
+diff --git a/src/components/Nav.tsx b/src/components/Nav.tsx
+index 5aa9289..4796ecd 100644
+--- a/src/components/Nav.tsx
++++ b/src/components/Nav.tsx
+@@ -2,9 +2,11 @@
+ 
+ import { useRef } from "react";
+ import { gsap, useGSAP } from "@/lib/gsap";
++import { useCart } from "@/lib/CartContext";
+ 
+ export default function Nav() {
+   const ref = useRef<HTMLElement>(null);
++  const { count, openCart } = useCart();
+ 
+   useGSAP(
+     () => {
+@@ -31,8 +33,13 @@ export default function Nav() {
+           <li><a href="#visit">Visit</a></li>
+         </ul>
+       </nav>
+-      <button className="nav__cart" type="button">
+-        Cart <span aria-hidden="true">·</span> 0
++      <button
++        className="nav__cart"
++        type="button"
++        onClick={openCart}
++        aria-label={`Open cart, ${count} item${count === 1 ? "" : "s"}`}
++      >
++        Cart <span aria-hidden="true">·</span> {count}
+       </button>
+     </header>
+   );
+diff --git a/src/components/Products.tsx b/src/components/Products.tsx
+index ab9ec8d..903421c 100644
+--- a/src/components/Products.tsx
++++ b/src/components/Products.tsx
+@@ -4,36 +4,17 @@ import { useRef } from "react";
+ import Image from "next/image";
+ import { gsap, useGSAP } from "@/lib/gsap";
+ import { IMAGES } from "@/lib/images";
++import { V1_PRODUCTS } from "@/lib/catalog";
++import { useCart } from "@/lib/CartContext";
+ 
+-const PRODUCTS = [
+-  {
+-    tag: "Harvest Oct 2025",
+-    name: "First Press",
+-    desc: "Koroneiki extra virgin, unfiltered. Green, peppery, loud. 500 ml.",
+-    price: "$38",
+-    img: IMAGES.productOil,
+-    alt: "Bottle of Verdale extra virgin olive oil with olives and branches",
+-  },
+-  {
+-    tag: "Brined 9 months",
+-    name: "Table Olives",
+-    desc: "Kalamata olives cured in sea-salt brine and a little red-wine vinegar. 320 g.",
+-    price: "$14",
+-    img: IMAGES.productOlives,
+-    alt: "Bowls of Kalamata and green table olives",
+-  },
+-  {
+-    tag: "The gift",
+-    name: "The Harvest Table",
+-    desc: "First Press, Table Olives and our fig-and-olive tapenade, boxed for giving.",
+-    price: "$64",
+-    img: IMAGES.productSet,
+-    alt: "A spread of olives, oil, cheese and bread on a table",
+-  },
+-];
++const PRODUCTS = V1_PRODUCTS.map((p) => ({
++  ...p,
++  img: IMAGES[p.imgKey],
++}));
+ 
+ export default function Products() {
+   const ref = useRef<HTMLElement>(null);
++  const { addItem } = useCart();
+ 
+   useGSAP(
+     () => {
+@@ -80,7 +61,14 @@ export default function Products() {
+               <p className="shop__price">{p.price}</p>
+             </div>
+             <p className="shop__desc">{p.desc}</p>
+-            <button className="shop__add" type="button">
++            <button
++              className="shop__add"
++              type="button"
++              onClick={() =>
++                addItem({ id: p.id, name: p.name, amount: p.amount, price: p.price })
++              }
++              aria-label={`Add ${p.name} to cart`}
++            >
+               Add to cart
+             </button>
+           </article>
+diff --git a/src/components/v2/V2Nav.tsx b/src/components/v2/V2Nav.tsx
+index 24020ba..830adda 100644
+--- a/src/components/v2/V2Nav.tsx
++++ b/src/components/v2/V2Nav.tsx
+@@ -3,9 +3,11 @@
+ import { useRef } from "react";
+ import Link from "next/link";
+ import { gsap, useGSAP } from "@/lib/gsap";
++import { useCart } from "@/lib/CartContext";
+ 
+ export default function V2Nav() {
+   const ref = useRef<HTMLElement>(null);
++  const { count, openCart } = useCart();
+ 
+   useGSAP(
+     () => {
+@@ -33,7 +35,14 @@ export default function V2Nav() {
+       </nav>
+       <div className="v2-nav__side">
+         <Link className="v2-nav__alt" href="/">Concept 01 ↗</Link>
+-        <button className="v2-nav__cart" type="button">Cart · 0</button>
++        <button
++          className="v2-nav__cart"
++          type="button"
++          onClick={openCart}
++          aria-label={`Open cart, ${count} item${count === 1 ? "" : "s"}`}
++        >
++          Cart · {count}
++        </button>
+       </div>
+     </header>
+   );
+diff --git a/src/components/v2/V2Rail.tsx b/src/components/v2/V2Rail.tsx
+index cbaeac8..03f4dea 100644
+--- a/src/components/v2/V2Rail.tsx
++++ b/src/components/v2/V2Rail.tsx
+@@ -4,44 +4,18 @@ import { useRef } from "react";
+ import Image from "next/image";
+ import { gsap, useGSAP } from "@/lib/gsap";
+ import { IMAGES } from "@/lib/images";
++import { V2_PRODUCTS } from "@/lib/catalog";
++import { useCart } from "@/lib/CartContext";
+ 
+-const PRODUCTS = [
+-  {
+-    tag: "Harvest Oct 2025",
+-    name: "First Press 500ml",
+-    desc: "Koroneiki extra virgin, unfiltered. The loud one.",
+-    price: "$38",
+-    img: IMAGES.productOil,
+-    alt: "Bottle of Verdale extra virgin olive oil",
+-  },
+-  {
+-    tag: "Brined 9 months",
+-    name: "Table Olives",
+-    desc: "Kalamata in sea-salt brine and red-wine vinegar. 320 g.",
+-    price: "$14",
+-    img: IMAGES.productOlives,
+-    alt: "Bowls of Kalamata and green table olives",
+-  },
+-  {
+-    tag: "The gift",
+-    name: "Harvest Table",
+-    desc: "Oil, olives and fig-and-olive tapenade, boxed for giving.",
+-    price: "$64",
+-    img: IMAGES.productSet,
+-    alt: "A spread of olives, oil, cheese and bread",
+-  },
+-  {
+-    tag: "Subscription",
+-    name: "The Press Club",
+-    desc: "A fresh 500 ml bottle every quarter, first press first.",
+-    price: "$34/qtr",
+-    img: IMAGES.pour,
+-    alt: "Golden olive oil being poured",
+-  },
+-];
++const PRODUCTS = V2_PRODUCTS.map((p) => ({
++  ...p,
++  desc: p.descShort,
++  img: IMAGES[p.imgKey],
++}));
+ 
+ export default function V2Rail() {
+   const ref = useRef<HTMLElement>(null);
++  const { addItem } = useCart();
+ 
+   useGSAP(
+     () => {
+@@ -97,7 +71,14 @@ export default function V2Rail() {
+                 <p className="v2-rail__price">{p.price}</p>
+               </div>
+               <p className="v2-rail__desc">{p.desc}</p>
+-              <button className="v2-rail__add" type="button">
++              <button
++                className="v2-rail__add"
++                type="button"
++                onClick={() =>
++                  addItem({ id: p.id, name: p.name, amount: p.amount, price: p.price })
++                }
++                aria-label={`Add ${p.name} to cart`}
++              >
+                 Add to cart
+               </button>
+             </article>
+diff --git a/src/lib/CartContext.tsx b/src/lib/CartContext.tsx
+new file mode 100644
+index 0000000..a565ad5
+--- /dev/null
++++ b/src/lib/CartContext.tsx
+@@ -0,0 +1,127 @@
++"use client";
++
++import {
++  createContext,
++  useContext,
++  useEffect,
++  useMemo,
++  useReducer,
++  useState,
++  type ReactNode,
++} from "react";
++
++export type CartItem = {
++  id: string;
++  name: string;
++  amount: number;
++  price: string;
++  qty: number;
++};
++
++type CartAction =
++  | { type: "HYDRATE"; items: CartItem[] }
++  | { type: "ADD"; item: Omit<CartItem, "qty"> }
++  | { type: "SET_QTY"; id: string; qty: number }
++  | { type: "REMOVE"; id: string }
++  | { type: "CLEAR" };
++
++type CartValue = {
++  items: CartItem[];
++  count: number;
++  subtotal: number;
++  isOpen: boolean;
++  openCart: () => void;
++  closeCart: () => void;
++  addItem: (item: Omit<CartItem, "qty">) => void;
++  setQty: (id: string, qty: number) => void;
++  removeItem: (id: string) => void;
++  clearCart: () => void;
++};
++
++const CartContext = createContext<CartValue | null>(null);
++const STORAGE_KEY = "verdale-cart-v1";
++
++function reducer(state: CartItem[], action: CartAction): CartItem[] {
++  switch (action.type) {
++    case "HYDRATE":
++      return action.items;
++    case "ADD": {
++      const existing = state.find((i) => i.id === action.item.id);
++      if (existing) {
++        return state.map((i) =>
++          i.id === action.item.id ? { ...i, qty: Math.min(i.qty + 1, 20) } : i
++        );
++      }
++      return [...state, { ...action.item, qty: 1 }];
++    }
++    case "SET_QTY": {
++      if (action.qty <= 0) return state.filter((i) => i.id !== action.id);
++      return state.map((i) =>
++        i.id === action.id ? { ...i, qty: Math.min(action.qty, 20) } : i
++      );
++    }
++    case "REMOVE":
++      return state.filter((i) => i.id !== action.id);
++    case "CLEAR":
++      return [];
++    default:
++      return state;
++  }
++}
++
++export function CartProvider({ children }: { children: ReactNode }) {
++  const [items, dispatch] = useReducer(reducer, []);
++  const [isOpen, setIsOpen] = useState(false);
++  const [hydrated, setHydrated] = useState(false);
++
++  // Load persisted cart on mount
++  useEffect(() => {
++    try {
++      const raw = window.localStorage.getItem(STORAGE_KEY);
++      if (raw) dispatch({ type: "HYDRATE", items: JSON.parse(raw) as CartItem[] });
++    } catch {
++      /* corrupted storage — start fresh */
++    }
++    setHydrated(true);
++  }, []);
++
++  // Persist on change (after hydration, so we never wipe the stored cart)
++  useEffect(() => {
++    if (!hydrated) return;
++    try {
++      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
++    } catch {
++      /* storage unavailable */
++    }
++  }, [items, hydrated]);
++
++  const value = useMemo<CartValue>(() => {
++    const count = items.reduce((n, i) => n + i.qty, 0);
++    const subtotal = items.reduce((n, i) => n + i.amount * i.qty, 0);
++    return {
++      items,
++      count,
++      subtotal,
++      isOpen,
++      openCart: () => setIsOpen(true),
++      closeCart: () => setIsOpen(false),
++      addItem: (item) => {
++        dispatch({ type: "ADD", item });
++        setIsOpen(true);
++      },
++      setQty: (id, qty) => dispatch({ type: "SET_QTY", id, qty }),
++      removeItem: (id) => dispatch({ type: "REMOVE", id }),
++      clearCart: () => dispatch({ type: "CLEAR" }),
++    };
++  }, [items, isOpen]);
++
++  return <CartContext.Provider value={value}>{children}</CartContext.Provider>;
++}
++
++export function useCart(): CartValue {
++  const ctx = useContext(CartContext);
++  if (!ctx) throw new Error("useCart must be used inside <CartProvider>");
++  return ctx;
++}
++
++export const formatMoney = (n: number) => `$${n.toFixed(2)}`;
+diff --git a/src/lib/catalog.ts b/src/lib/catalog.ts
+new file mode 100644
+index 0000000..e33ce27
+--- /dev/null
++++ b/src/lib/catalog.ts
+@@ -0,0 +1,77 @@
++/**
++ * Verdale catalog — plain data, safe to import from client components
++ * and server route handlers alike. Prices live here ONLY: the checkout
++ * API resolves every cart item against this file, so the client can
++ * never invent its own prices.
++ *
++ * Note: "The Press Club" is presented as a quarterly subscription on
++ * the /v2 rail; at checkout it is charged as a one-time payment for
++ * the first quarter. Recurring billing would need a Stripe recurring
++ * price + webhook handling — out of scope for this pass.
++ */
++
++export type CatalogItem = {
++  id: string;
++  name: string;
++  tag: string;
++  desc: string;
++  descShort: string;
++  amount: number; // USD
++  price: string; // display string
++  imgKey: "productOil" | "productOlives" | "productSet" | "pour";
++  alt: string;
++};
++
++export const PRODUCTS: CatalogItem[] = [
++  {
++    id: "first-press",
++    name: "First Press",
++    tag: "Harvest Oct 2025",
++    desc: "Koroneiki extra virgin, unfiltered. Green, peppery, loud. 500 ml.",
++    descShort: "Koroneiki extra virgin, unfiltered. The loud one.",
++    amount: 38,
++    price: "$38",
++    imgKey: "productOil",
++    alt: "Bottle of Verdale extra virgin olive oil with olives and branches",
++  },
++  {
++    id: "table-olives",
++    name: "Table Olives",
++    tag: "Brined 9 months",
++    desc: "Kalamata olives cured in sea-salt brine and a little red-wine vinegar. 320 g.",
++    descShort: "Kalamata in sea-salt brine and red-wine vinegar. 320 g.",
++    amount: 14,
++    price: "$14",
++    imgKey: "productOlives",
++    alt: "Bowls of Kalamata and green table olives",
++  },
++  {
++    id: "harvest-table",
++    name: "The Harvest Table",
++    tag: "The gift",
++    desc: "First Press, Table Olives and our fig-and-olive tapenade, boxed for giving.",
++    descShort: "Oil, olives and fig-and-olive tapenade, boxed for giving.",
++    amount: 64,
++    price: "$64",
++    imgKey: "productSet",
++    alt: "A spread of olives, oil, cheese and bread on a table",
++  },
++  {
++    id: "press-club",
++    name: "The Press Club",
++    tag: "Subscription",
++    desc: "A fresh 500 ml bottle every quarter, first press first. Billed per quarter.",
++    descShort: "A fresh 500 ml bottle every quarter, first press first.",
++    amount: 34,
++    price: "$34/qtr",
++    imgKey: "pour",
++    alt: "Golden olive oil being poured",
++  },
++];
++
++/** The original landing page shows the first three; /v2 shows all four. */
++export const V1_PRODUCTS = PRODUCTS.slice(0, 3);
++export const V2_PRODUCTS = PRODUCTS;
++
++export const findItem = (id: string): CatalogItem | undefined =>
++  PRODUCTS.find((p) => p.id === id);
+-- 
+2.43.0
+

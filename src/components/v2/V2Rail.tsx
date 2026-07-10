@@ -4,44 +4,18 @@ import { useRef } from "react";
 import Image from "next/image";
 import { gsap, useGSAP } from "@/lib/gsap";
 import { IMAGES } from "@/lib/images";
+import { V2_PRODUCTS } from "@/lib/catalog";
+import { useCart } from "@/lib/CartContext";
 
-const PRODUCTS = [
-  {
-    tag: "Harvest Oct 2025",
-    name: "First Press 500ml",
-    desc: "Koroneiki extra virgin, unfiltered. The loud one.",
-    price: "$38",
-    img: IMAGES.productOil,
-    alt: "Bottle of Verdale extra virgin olive oil",
-  },
-  {
-    tag: "Brined 9 months",
-    name: "Table Olives",
-    desc: "Kalamata in sea-salt brine and red-wine vinegar. 320 g.",
-    price: "$14",
-    img: IMAGES.productOlives,
-    alt: "Bowls of Kalamata and green table olives",
-  },
-  {
-    tag: "The gift",
-    name: "Harvest Table",
-    desc: "Oil, olives and fig-and-olive tapenade, boxed for giving.",
-    price: "$64",
-    img: IMAGES.productSet,
-    alt: "A spread of olives, oil, cheese and bread",
-  },
-  {
-    tag: "Subscription",
-    name: "The Press Club",
-    desc: "A fresh 500 ml bottle every quarter, first press first.",
-    price: "$34/qtr",
-    img: IMAGES.pour,
-    alt: "Golden olive oil being poured",
-  },
-];
+const PRODUCTS = V2_PRODUCTS.map((p) => ({
+  ...p,
+  desc: p.descShort,
+  img: IMAGES[p.imgKey],
+}));
 
 export default function V2Rail() {
   const ref = useRef<HTMLElement>(null);
+  const { addItem } = useCart();
 
   useGSAP(
     () => {
@@ -97,7 +71,14 @@ export default function V2Rail() {
                 <p className="v2-rail__price">{p.price}</p>
               </div>
               <p className="v2-rail__desc">{p.desc}</p>
-              <button className="v2-rail__add" type="button">
+              <button
+                className="v2-rail__add"
+                type="button"
+                onClick={() =>
+                  addItem({ id: p.id, name: p.name, amount: p.amount, price: p.price })
+                }
+                aria-label={`Add ${p.name} to cart`}
+              >
                 Add to cart
               </button>
             </article>
